@@ -10,8 +10,10 @@
 
 #include <CommonCrypto/CommonDigest.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,7 +89,7 @@ static int write_string(int fd, const char *value) {
   return write_u32(fd, (uint32_t)length) || write_all(fd, value, length);
 }
 
-static const char *cache_directory(int argc, char **argv) {
+static const char *cache_directory(int argc, char *const argv[]) {
   for (int index = 1; index + 1 < argc; ++index) {
     if (strcmp(argv[index], "-incremental_cache") == 0) return argv[index + 1];
   }
@@ -113,6 +115,11 @@ static int make_socket_path(const char *cache_directory, char *buffer, size_t bu
 static int connect_socket(const char *socket_path) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) return -1;
+  int no_sigpipe = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+    close(fd);
+    return -1;
+  }
   struct sockaddr_un address;
   memset(&address, 0, sizeof(address));
   address.sun_family = AF_UNIX;
@@ -128,12 +135,19 @@ static int connect_socket(const char *socket_path) {
   return fd;
 }
 
+// The service can outlive this short-lived linker client. Give it no Cargo/Rustc standard-stream
+// pipes, otherwise their readers may wait for the service's idle lifetime after the link exits.
 static void start_service(const char *server, const char *cache_directory) {
-  pid_t child = fork();
-  if (child != 0) return;
+  posix_spawn_file_actions_t file_actions;
+  if (posix_spawn_file_actions_init(&file_actions) != 0) return;
+  int configured =
+      posix_spawn_file_actions_addopen(&file_actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
+      posix_spawn_file_actions_addopen(&file_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) == 0 &&
+      posix_spawn_file_actions_addopen(&file_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0;
   char *const service_argv[] = {(char *)server, SERVICE_ARGUMENT, (char *)cache_directory, NULL};
-  execve(server, service_argv, environ);
-  _exit(127);
+  pid_t child;
+  if (configured) (void)posix_spawn(&child, server, &file_actions, NULL, service_argv, environ);
+  (void)posix_spawn_file_actions_destroy(&file_actions);
 }
 
 static int connect_or_start(const char *socket_path, const char *server, const char *cache_directory) {
@@ -158,7 +172,7 @@ static uint64_t read_low_u128(const unsigned char *value) {
 }
 
 static int submit_request(
-    int fd, int argc, char **argv, uint64_t *server_ns, uint64_t *parse_ns, uint64_t *apply_ns) {
+    int fd, int argc, char *const argv[], uint64_t *server_ns, uint64_t *parse_ns, uint64_t *apply_ns) {
   char cwd[PATH_MAX];
   if (getcwd(cwd, sizeof(cwd)) == NULL) return -1;
   if (write_all(fd, request_magic, sizeof(request_magic)) != 0 || write_string(fd, cwd) != 0 ||
@@ -176,30 +190,33 @@ static int submit_request(
   return response[0] == 1 ? 1 : 0;
 }
 
+#ifndef WILD_MACHO_CACHE_CLIENT_NO_MAIN
 static void exec_fallback(const char *server, char **argv) {
   signal(SIGPIPE, SIG_DFL);
   execve(server, argv, environ);
   fprintf(stderr, "wild cache client: failed to exec %s: %s\n", server, strerror(errno));
   _exit(127);
 }
+#endif
 
-int main(int argc, char **argv) {
-  // A stale or incompatible service may close while we are still sending its request. Treat that
-  // as an ordinary cache miss and exec Wild rather than letting the shim terminate on SIGPIPE.
-  signal(SIGPIPE, SIG_IGN);
+/*
+ * Applies an exact argv through the cache service without replacing this process on a miss.
+ *
+ * This is shared with the opt-in Rustc inline client, which must preserve its parent process and
+ * delegate ordinary links back to Rustc's original spawn call. The service still owns all
+ * parsing, validation, patching, signing, and output publication; a false result is the same
+ * conservative cache miss as the standalone client's exec fallback.
+ */
+static int macho_cache_try_apply(int argc, char *const argv[]) {
   uint64_t request_started = monotonic_ns();
   const char *server = getenv(SERVER_ENV);
   const char *cache = cache_directory(argc, argv);
-  if (server == NULL || server[0] == '\0' || cache == NULL || getenv(CACHE_ENV) == NULL) {
-    if (server != NULL && server[0] != '\0') exec_fallback(server, argv);
-    fprintf(stderr, "wild cache client requires %s\n", SERVER_ENV);
-    return 127;
-  }
+  if (server == NULL || server[0] == '\0' || cache == NULL || getenv(CACHE_ENV) == NULL) return 0;
 
   char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-  if (make_socket_path(cache, socket_path, sizeof(socket_path)) != 0) exec_fallback(server, argv);
+  if (make_socket_path(cache, socket_path, sizeof(socket_path)) != 0) return 0;
   int fd = connect_or_start(socket_path, server, cache);
-  if (fd < 0) exec_fallback(server, argv);
+  if (fd < 0) return 0;
   uint64_t server_ns = 0;
   uint64_t parse_ns = 0;
   uint64_t apply_ns = 0;
@@ -223,7 +240,20 @@ int main(int argc, char **argv) {
           (unsigned long long)parse_ns,
           (unsigned long long)apply_ns);
     }
-    return 0;
+    return 1;
   }
-  exec_fallback(server, argv);
+  return 0;
 }
+
+#ifndef WILD_MACHO_CACHE_CLIENT_NO_MAIN
+int main(int argc, char **argv) {
+  // A stale or incompatible service may close while we are still sending its request. Treat that
+  // as an ordinary cache miss and exec Wild rather than letting the shim terminate on SIGPIPE.
+  signal(SIGPIPE, SIG_IGN);
+  if (macho_cache_try_apply(argc, argv)) return 0;
+  const char *server = getenv(SERVER_ENV);
+  if (server != NULL && server[0] != '\0') exec_fallback(server, argv);
+  fprintf(stderr, "wild cache client requires %s\n", SERVER_ENV);
+  return 127;
+}
+#endif

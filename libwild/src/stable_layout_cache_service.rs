@@ -32,7 +32,12 @@ const REQUEST_MAGIC: &[u8] = b"WILD-MACHO-CACHE-SERVICE-3\0";
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARGUMENTS: usize = 100_000;
 const STARTUP_RETRIES: usize = 100;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_IDLE_SECONDS";
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+// Rustc can spend tens of seconds in incremental code generation before it reaches the next final
+// link. The opt-in duration remains bounded so a forgotten service cannot retain the image
+// indefinitely, while callers that need it can preserve the next link's in-memory state.
+const MAX_IDLE_TIMEOUT_SECONDS: u64 = 300;
 
 pub(crate) fn requested() -> bool {
     env::var_os(ENABLE_ENV).is_some()
@@ -90,12 +95,13 @@ pub fn run(cache_dir: PathBuf, version: &'static str) -> crate::error::Result {
         Err(_) => return Ok(()),
     };
     let _cleanup = SocketCleanup(socket);
+    let _resident_image_cleanup = ResidentImageCleanup;
     let _ = fs::set_permissions(listener_path(&_cleanup.0), fs::Permissions::from_mode(0o600));
     let _ = listener.set_nonblocking(true);
     stable_layout_cache::enable_resident_image_cache();
 
     loop {
-        if !wait_for_request(&listener)? {
+        if !wait_for_request(&listener, configured_idle_timeout())? {
             return Ok(());
         }
         match listener.accept() {
@@ -136,13 +142,29 @@ pub fn run(cache_dir: PathBuf, version: &'static str) -> crate::error::Result {
     }
 }
 
+/// Returns the service lifetime requested by the caller, preserving the historical short default
+/// when the explicit performance setting is absent or invalid.
+fn configured_idle_timeout() -> Duration {
+    let seconds = env::var(IDLE_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    idle_timeout_from_seconds(seconds)
+}
+
+fn idle_timeout_from_seconds(seconds: Option<u64>) -> Duration {
+    seconds
+        .filter(|seconds| (1..=MAX_IDLE_TIMEOUT_SECONDS).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT)
+}
+
 /// Blocks until a client connects or the service has been idle long enough to clean itself up.
 ///
 /// The listener stays nonblocking after readiness because an unrelated peer may disconnect before
 /// `accept`. `poll` avoids the former 20 ms sleep between checks, which was visible in each tiny
 /// incremental link's wall time.
-fn wait_for_request(listener: &UnixListener) -> io::Result<bool> {
-    let timeout = i32::try_from(IDLE_TIMEOUT.as_millis()).expect("idle timeout fits poll");
+fn wait_for_request(listener: &UnixListener, idle_timeout: Duration) -> io::Result<bool> {
+    let timeout = i32::try_from(idle_timeout.as_millis()).expect("idle timeout fits poll");
     let mut descriptor = libc::pollfd {
         fd: listener.as_raw_fd(),
         events: libc::POLLIN,
@@ -352,6 +374,35 @@ impl Drop for SocketCleanup {
     }
 }
 
+/// The resident image is intentionally process-local. Remove its APFS clone when this bounded
+/// service stops so its warm-link speedup does not turn into a persistent cache allocation.
+struct ResidentImageCleanup;
+
+impl Drop for ResidentImageCleanup {
+    fn drop(&mut self) {
+        stable_layout_cache::clear_resident_image_cache();
+    }
+}
+
 fn listener_path(path: &Path) -> &Path {
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_IDLE_TIMEOUT;
+    use super::MAX_IDLE_TIMEOUT_SECONDS;
+    use super::idle_timeout_from_seconds;
+    use std::time::Duration;
+
+    #[test]
+    fn service_idle_timeout_is_explicit_and_bounded() {
+        assert_eq!(idle_timeout_from_seconds(None), DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(idle_timeout_from_seconds(Some(0)), DEFAULT_IDLE_TIMEOUT);
+        assert_eq!(idle_timeout_from_seconds(Some(120)), Duration::from_secs(120));
+        assert_eq!(
+            idle_timeout_from_seconds(Some(MAX_IDLE_TIMEOUT_SECONDS + 1)),
+            DEFAULT_IDLE_TIMEOUT
+        );
+    }
 }

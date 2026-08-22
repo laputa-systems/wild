@@ -172,12 +172,15 @@ decision.
 The first verified Rustc-private cache hit measured `90.7 ms` against `171.5 ms` for Apple ld64
 (`0.529×`) on the paired Cargo capture. Eliminating the per-hit sidecar checkpoint improved the
 ordinary cache path to `82.1 ms` against `173.3 ms` (`0.473×`): it retains its immutable baseline
-until all 16 bounded direct-object changes need a rebase. This preserves a normal-link recovery
+until all 32 bounded direct-object changes need a rebase. This preserves a normal-link recovery
 path while removing an unnecessary second 29 MB write from ordinary one-object iterations.
 
 The experimental macOS-only resident service, enabled with
 `WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1`, keeps one validated current image and mutable input
-state in a same-user Unix-socket process. Set
+state in a same-user Unix-socket process. It exits after 10 seconds by default. Set
+`WILD_MACHO_INCREMENTAL_CACHE_SERVICE_IDLE_SECONDS=120` for a warm Cargo screen: that bounded
+interval covers incremental Rust code generation between final links without retaining the service
+indefinitely. Set
 `WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR=$HOME/.cache/wild/services` when a long cache-root path
 would exceed the macOS socket-path limit. A native macOS client built from
 `wild/src/bin/macho-cache-client.c` submits raw linker argv without starting the Rust linker on a
@@ -187,22 +190,82 @@ readiness, then switches accepted streams back to blocking mode so a partially w
 never mistaken for a cache miss. A missing, stale, or failed service request falls through to the
 ordinary cache/normal-link recovery path. The socket and short-lived process live below
 `~/.cache/wild`; different cache roots use distinct hashed sockets and the direct screen removes
-its exact completed-screen socket.
+its exact completed-screen socket. On APFS, a resident hit stages a copy-on-write clone, patches
+only its changed pages, and atomically publishes it. The service keeps a private clone only while
+it is alive, then removes it on the bounded idle exit; this avoids a repeated full executable
+write without turning the warm image into permanent cache growth.
 
 The thin client plus resident service confirmed `54.77 ms` against `172.15 ms` for Apple ld64 on
 the 11-replay paired Cargo screen (`0.318×`, `3.14×` faster). Every timed result had the normal
-cache-hit marker plus strict `codesign` and Cargo runtime validation. This clears the `≤0.333×`
-promotion target without a cold-build metric.
+cache-hit marker plus strict `codesign` and Cargo runtime validation.
 
-The next work is to preserve that margin under broader incremental topologies and reduce the
-remaining fresh executable publication cost. Do not claim a win from cold builds or from daemon
-warm-up/restart outside a timed direct replay.
+### Rustc parent-side inline cache
 
-Goal prompt: make macOS ARM64 Wild incremental linking consistently `≥3×` faster than Apple ld64
-on qualified Cargo direct replays—`≤0.333×` median, `100%` verified cache hits, strict `codesign`,
-runtime smoke, bounded disk under `~/.cache/wild`, and no cold-build metric—then pursue `4×`
-(`≤0.25×`) by reducing safe output publication and process-launch overhead without weakening
-fail-closed cache validation.
+`macho-cache-inline.c` is an additional, explicitly opt-in macOS client for warmed Cargo links.
+Rustc already owns the complete linker argv when it calls `posix_spawn`; the injected library
+sends that argv to the same verified resident service in the Rustc parent. A cache hit publishes
+the signed output there, then replaces the expensive linker child with `/usr/bin/true` while
+preserving Rustc's original spawn attributes and file actions. It also handles `posix_spawnp` for
+PATH-resolved clients. A miss uses the untouched linker argv with the original spawn behavior. The
+Rust service remains the sole authority for parsing, validation, patching, signing, and
+publication.
+
+Build the standalone cache client and the injected library together, then make Rustc use the
+client as a direct Darwin linker. `DYLD_INSERT_LIBRARIES` must reach the real Cargo and Rustc
+binaries; Rustup's proxy deliberately strips it, so resolve the selected toolchain first and set
+`RUSTC` to that real compiler. The library considers only link commands containing
+`-incremental_cache` and the explicit inline opt-in.
+
+```sh
+cache_client="$cache_root/wild-macho-cache-client"
+inline_client="$cache_root/wild-macho-cache-inline.dylib"
+service_dir="$cache_root/services"
+cache_dir="$cache_root/stable-layout-cache"
+wild_server="$cargo_target/aarch64-apple-darwin/dist/wild"
+toolchain="nightly-2026-07-24"
+rustc="$(rustup which rustc --toolchain "$toolchain")"
+cargo="$(rustup which cargo --toolchain "$toolchain")"
+
+cc -O2 -Wall -Wextra -Werror wild/src/bin/macho-cache-client.c -o "$cache_client"
+cc -dynamiclib -O2 -Wall -Wextra -Werror wild/src/bin/macho-cache-inline.c -o "$inline_client"
+
+export DYLD_INSERT_LIBRARIES="$inline_client"
+export WILD_MACHO_INCREMENTAL_CACHE_INLINE=1
+export WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1
+export WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR="$service_dir"
+export WILD_MACHO_INCREMENTAL_CACHE_SERVICE_SERVER="$wild_server"
+export WILD_MACHO_INCREMENTAL_CACHE_SERVICE_IDLE_SECONDS=120
+export RUSTC="$rustc"
+export RUSTFLAGS="-Z unstable-options -C linker=$cache_client -C linker-flavor=darwin -C link-arg=-incremental_cache -C link-arg=$cache_dir"
+
+"$cargo" build --target aarch64-apple-darwin
+```
+
+Set `WILD_MACHO_INCREMENTAL_CACHE_INLINE_DIAGNOSTICS=1` only when diagnosing the parent boundary;
+it reports inspection and either the replacement marker or the conservative cache-miss fallback.
+The integration test
+`macho/aarch64/stable-layout-cache-inline-parent/default` compiles the dynamic library, exercises
+non-null `posix_spawn` and `posix_spawnp` file-action and attribute objects, and verifies the
+cache-published binary with strict `codesign` plus a runtime exit check.
+
+The direct `posix_spawn` screen of the matched Cargo capture measured a 13.071 ms median across 14
+cache hits, against the retained 173.005 ms Apple ld64 control: `0.0756×`, or `13.236×` faster.
+Its exact artifact is
+`~/.cache/wild/benchmarks/cargo-inline-direct-posix-spawn-hot-2026-08-22.json`. It replays the raw
+Cargo linker argv from a Rustc-equivalent direct `posix_spawn` parent and alternates a four-byte
+semantically equivalent AArch64 `ret`/`br x30` change in one captured direct object. The 21.749 ms
+first cache hit creates the private APFS clone and is excluded; the 14 timed transitions reuse it.
+Every included sample emitted the cache-hit marker; the last output passed strict `codesign`, was
+ARM64 Mach-O, and `cargo --version` returned successfully. Separately, a real `cargo rustc`
+baseline followed by both `min(100, …) → min(101, …)` and reverse edits each emitted the inline
+inspection, cache-hit, and replacement markers, then passed the same signing/runtime checks.
+That execution uses a cache-owned target path rather than `/tmp`: Rustc preserves the `/tmp`
+argument spelling while macOS canonicalizes it to `/private/tmp`, which intentionally fails the
+cache's no-symlink moved-object proof. The integration test separately verifies direct and
+PATH-resolved parent calls with non-null spawn attributes and file actions. The timed screen is a
+warmed incremental-link boundary after Rustc has formed its linker argv, not a full Cargo build or
+a service-start result. Keep strict signing and runtime checks for every promotion, and do not
+claim a warm-link result from a cold build or a daemon restart.
 
 ### One authoritative qualification run
 

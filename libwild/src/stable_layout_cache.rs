@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
+use std::env;
 use std::fs;
 use std::io::Write as _;
 use std::mem::size_of;
@@ -55,7 +56,10 @@ const MAX_RECORDS: usize = 100_000;
 /// Cache hits may compose a small group of independent direct objects. Bounding both dimensions
 /// keeps an unexpectedly broad rebuild on the normal-link path instead of retaining many mapped
 /// inputs or spending an unbounded amount of time validating their structures.
-const MAX_CHANGED_DIRECT_OBJECTS: usize = 16;
+// Cargo's `linker-stress` profile can regenerate more than one object per codegen unit for a
+// fixed-width source edit. Keep the multi-object cache path explicitly bounded, but cover the
+// observed 18-object Rustc transition rather than falling back to a full link at 16.
+const MAX_CHANGED_DIRECT_OBJECTS: usize = 32;
 const MAX_CHANGED_DIRECT_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 /// Domains the v5 structural digest away from ordinary byte hashes and older cache layouts.
@@ -417,7 +421,13 @@ enum PreparedOutput {
 struct ResidentImage {
     cache_image: PathBuf,
     state: ImageState,
-    bytes: Vec<u8>,
+    storage: ResidentImageStorage,
+}
+
+enum ResidentImageStorage {
+    InMemory(Vec<u8>),
+    #[cfg(target_os = "macos")]
+    Cloned(PathBuf),
 }
 
 static RESIDENT_IMAGE_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -425,6 +435,28 @@ static RESIDENT_IMAGE: OnceLock<Mutex<Option<ResidentImage>>> = OnceLock::new();
 
 pub(crate) fn enable_resident_image_cache() {
     RESIDENT_IMAGE_CACHE_ENABLED.store(true, Ordering::Relaxed);
+    if env::var_os(DIAGNOSTICS_ENV).is_some() {
+        eprintln!("wild: Mach-O stable-layout resident image cache enabled");
+    }
+}
+
+/// Releases the service-only staged image before the cache service exits. The disk cache image
+/// remains the ordinary crash-recovery baseline; this clone only exists to make the next resident
+/// request copy-on-write without holding an extra full output after the bounded idle lifetime.
+pub(crate) fn clear_resident_image_cache() {
+    let Some(resident) = RESIDENT_IMAGE.get() else {
+        return;
+    };
+    let Ok(mut resident) = resident.lock() else {
+        return;
+    };
+    let Some(image) = resident.take() else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    if let ResidentImageStorage::Cloned(path) = image.storage {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn resident_image_cache_enabled() -> bool {
@@ -432,7 +464,7 @@ fn resident_image_cache_enabled() -> bool {
 }
 
 fn resident_image_state(cache_image: &Path) -> Option<ImageState> {
-    resident_image_cache_enabled().then(|| {
+    let state = resident_image_cache_enabled().then(|| {
         RESIDENT_IMAGE
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -440,29 +472,114 @@ fn resident_image_state(cache_image: &Path) -> Option<ImageState> {
             .as_ref()
             .filter(|image| image.cache_image == cache_image)
             .map(|image| image.state.clone())
-    })?
+    })?;
+    if env::var_os(DIAGNOSTICS_ENV).is_some() {
+        eprintln!(
+            "wild: Mach-O stable-layout resident image state {} for {}",
+            if state.is_some() { "hit" } else { "miss" },
+            cache_image.display()
+        );
+    }
+    state
 }
 
-fn take_resident_image(cache_image: &Path, state: &ImageState) -> Option<Vec<u8>> {
+fn take_resident_image(cache_image: &Path, state: &ImageState) -> Option<ResidentImageStorage> {
     resident_image_cache_enabled().then(|| {
         let mut resident = RESIDENT_IMAGE.get_or_init(|| Mutex::new(None)).lock().ok()?;
         (resident.as_ref().is_some_and(|image| {
             image.cache_image == cache_image && image.state == *state
         }))
-        .then(|| resident.take().expect("resident image was checked").bytes)
+        .then(|| match &resident.as_ref().expect("resident image was checked").storage {
+            ResidentImageStorage::InMemory(_) => {
+                resident.take().expect("resident image was checked").storage
+            }
+            #[cfg(target_os = "macos")]
+            ResidentImageStorage::Cloned(path) => ResidentImageStorage::Cloned(path.clone()),
+        })
     })?
 }
 
-fn store_resident_image(cache_image: PathBuf, state: ImageState, bytes: Vec<u8>) {
+fn store_resident_image(cache_image: PathBuf, state: ImageState, storage: ResidentImageStorage) {
     if resident_image_cache_enabled() {
         if let Ok(mut resident) = RESIDENT_IMAGE.get_or_init(|| Mutex::new(None)).lock() {
-            *resident = Some(ResidentImage {
+            if env::var_os(DIAGNOSTICS_ENV).is_some() {
+                eprintln!(
+                    "wild: Mach-O stable-layout resident image store: {} for {}",
+                    match &storage {
+                        ResidentImageStorage::InMemory(bytes) => format!("{} in-memory bytes", bytes.len()),
+                        #[cfg(target_os = "macos")]
+                        ResidentImageStorage::Cloned(path) => format!("clone {}", path.display()),
+                    },
+                    cache_image.display()
+                );
+            }
+            #[cfg(target_os = "macos")]
+            let new_clone_path = match &storage {
+                ResidentImageStorage::InMemory(_) => None,
+                ResidentImageStorage::Cloned(path) => Some(path.clone()),
+            };
+            let previous = resident.replace(ResidentImage {
                 cache_image,
                 state,
-                bytes,
+                storage,
             });
+            #[cfg(target_os = "macos")]
+            if let Some(ResidentImage {
+                storage: ResidentImageStorage::Cloned(path),
+                ..
+            }) = previous
+            {
+                if new_clone_path.as_ref() != Some(&path) {
+                    let _ = fs::remove_file(path);
+                }
+            }
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_resident_image(path: &Path, args: &MachOArgs) -> Option<MutableOutput> {
+    let staged_path = clone_temporary_path(args.output());
+    clone_file(path, &staged_path).ok()?;
+    let file = match fs::OpenOptions::new().read(true).write(true).open(&staged_path) {
+        Ok(file) => file,
+        Err(_) => {
+            let _ = fs::remove_file(&staged_path);
+            return None;
+        }
+    };
+    if crate::make_executable(&file).is_err() {
+        let _ = fs::remove_file(&staged_path);
+        return None;
+    }
+    let mapping = match unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
+        Ok(mapping) => mapping,
+        Err(_) => {
+            let _ = fs::remove_file(&staged_path);
+            return None;
+        }
+    };
+    Some(MutableOutput::Cloned {
+        staged_path,
+        mapping,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn store_resident_clone(cache_dir: &Path, args: &MachOArgs, cache_image: PathBuf, state: ImageState) {
+    if !resident_image_cache_enabled() {
+        return;
+    }
+    let destination = resident_image_path(cache_dir, args);
+    let staged_path = clone_temporary_path(&destination);
+    if clone_file(args.output(), &staged_path).is_err() {
+        return;
+    }
+    if fs::rename(&staged_path, &destination).is_err() {
+        let _ = fs::remove_file(staged_path);
+        return;
+    }
+    store_resident_image(cache_image, state, ResidentImageStorage::Cloned(destination));
 }
 
 impl MutableOutput {
@@ -709,7 +826,17 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             _ => manifest.objects_for_inputs(&changed_input_indices).ok(),
         };
         let Some(objects) = objects else {
-            return cache_miss("a changed object has no cached positional record");
+            let missing = changed_input_indices.iter().find(|input_index| {
+                manifest
+                    .object_for_input(**input_index)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            });
+            return cache_miss(&format!(
+                "a changed object has no cached positional record{}",
+                missing.map(|input_index| format!(" at input {input_index}")).unwrap_or_default()
+            ));
         };
         objects
     };
@@ -775,13 +902,24 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     let mut output = {
         timing_phase!("Mach-O stable-layout cache: materialize cache-owned image");
         #[cfg(target_os = "macos")]
-        let output = take_resident_image(&cache_image, &state)
-            .map(MutableOutput::InMemory)
-            .or_else(|| fs::read(&cache_image).ok().map(MutableOutput::InMemory))
-            .or_else(|| clone_baseline_image(cache_dir, args));
+        let output = if resident_image_cache_enabled() {
+            take_resident_image(&cache_image, &state)
+                .and_then(|storage| match storage {
+                    ResidentImageStorage::InMemory(bytes) => Some(MutableOutput::InMemory(bytes)),
+                    ResidentImageStorage::Cloned(path) => clone_resident_image(&path, args),
+                })
+                // First resident request can stage the immutable cache image as an APFS COW
+                // clone. This avoids both a 29 MiB userspace copy and a 29 MiB output write.
+                .or_else(|| clone_baseline_image(cache_dir, args))
+                .or_else(|| fs::read(&cache_image).ok().map(MutableOutput::InMemory))
+        } else {
+            fs::read(&cache_image).ok().map(MutableOutput::InMemory)
+        };
         #[cfg(not(target_os = "macos"))]
         let output = take_resident_image(&cache_image, &state)
-            .map(MutableOutput::InMemory)
+            .and_then(|storage| match storage {
+                ResidentImageStorage::InMemory(bytes) => Some(MutableOutput::InMemory(bytes)),
+            })
             .or_else(|| fs::read(&cache_image).ok().map(MutableOutput::InMemory));
         let Some(output) = output else {
             return cache_miss("owned baseline image is absent");
@@ -964,16 +1102,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // edits can patch directly from that immutable baseline, avoiding a second full-image write
     // on the hot path. A full group checkpoints the current image so the next edit starts a new
     // bounded lineage rather than accumulating an unbounded patch set.
-    let resident_state = ImageState {
-        inputs: current_inputs
-            .into_iter()
-            .map(|mut input| {
-                input.direct_object_bytes = None;
-                input
-            })
-            .collect(),
-        ..state.clone()
-    };
+    let resident_state = resident_state_after_hit(&state, current_inputs);
     if changed.len() == MAX_CHANGED_DIRECT_OBJECTS {
         state = resident_state.clone();
         // Publish the owned image before its matching mutable state. An interrupted update can
@@ -1002,8 +1131,14 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
     }
     if resident_image_cache_enabled() {
-        if let PreparedOutput::InMemory(bytes) = output {
-            store_resident_image(cache_image, resident_state, bytes);
+        match output {
+            PreparedOutput::InMemory(bytes) => {
+                store_resident_image(cache_image, resident_state, ResidentImageStorage::InMemory(bytes));
+            }
+            #[cfg(target_os = "macos")]
+            PreparedOutput::Cloned(_) => {
+                store_resident_clone(cache_dir, args, cache_image, resident_state);
+            }
         }
     }
     eprintln!(
@@ -1015,6 +1150,26 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
 
 fn changed_object_count_is_supported(count: usize) -> bool {
     (1..=MAX_CHANGED_DIRECT_OBJECTS).contains(&count)
+}
+
+/// Records the actual changed-object digest only in the service's mutable state. A cache hit
+/// already has the bounded changed object mapped for patching, so this avoids a second file read
+/// while ensuring the next resident request can distinguish a new object from an equal-content
+/// moved direct object. The on-disk state still checkpoints only at the bounded group limit.
+fn resident_state_after_hit(state: &ImageState, current_inputs: Vec<InputDigest>) -> ImageState {
+    ImageState {
+        inputs: current_inputs
+            .into_iter()
+            .map(|mut input| {
+                if let Some(snapshot) = &input.direct_object_bytes {
+                    input.digest = *blake3::hash(snapshot.bytes()).as_bytes();
+                }
+                input.direct_object_bytes = None;
+                input
+            })
+            .collect(),
+        ..state.clone()
+    }
 }
 
 #[cfg(test)]
@@ -1260,6 +1415,16 @@ fn cache_path(cache_dir: &Path, args: &MachOArgs) -> PathBuf {
 
 fn cache_image_path(cache_dir: &Path, args: &MachOArgs) -> PathBuf {
     cache_paths(cache_dir, args).1
+}
+
+/// The service-only image is an APFS clone of the last successful output. It lets the next
+/// resident request stage a copy-on-write output without depending on Cargo to preserve its
+/// public output pathname between compiler processes.
+#[cfg(target_os = "macos")]
+fn resident_image_path(cache_dir: &Path, args: &MachOArgs) -> PathBuf {
+    let image = cache_image_path(cache_dir, args);
+    let name = image.file_name().and_then(|name| name.to_str()).unwrap_or("image");
+    cache_dir.join(format!(".{name}.resident"))
 }
 
 fn cache_state_path(cache_dir: &Path, args: &MachOArgs) -> PathBuf {
@@ -4607,6 +4772,7 @@ mod tests {
     use super::cache_approved_rustc_temporary_archives;
     use super::cache_hit_input_path;
     use super::read_existing_output_baseline;
+    use super::resident_state_after_hit;
     #[cfg(target_os = "macos")]
     use super::clone_file;
     #[cfg(target_os = "macos")]
@@ -5151,6 +5317,36 @@ mod tests {
     }
 
     #[test]
+    fn resident_state_hashes_changed_direct_object_bytes() {
+        let state = ImageState {
+            arguments_digest: [1; HASH_SIZE],
+            manifest_checksum: [2; HASH_SIZE],
+            cache_image_token: [3; 16],
+            uuid_seed: [4; HASH_SIZE],
+            output_len: 5,
+            inputs: vec![InputDigest {
+                path: "/tmp/main.o".to_owned(),
+                digest: [6; HASH_SIZE],
+                direct_object_bytes: None,
+                metadata: test_input_metadata(),
+            }],
+        };
+        let changed_bytes = Arc::<[u8]>::from([7, 8, 9]);
+        let resident = resident_state_after_hit(
+            &state,
+            vec![InputDigest {
+                path: "/tmp/main.o".to_owned(),
+                digest: [6; HASH_SIZE],
+                direct_object_bytes: Some(DirectObjectSnapshot::InMemory(changed_bytes.clone())),
+                metadata: test_input_metadata(),
+            }],
+        );
+
+        assert_eq!(resident.inputs[0].digest, *blake3::hash(&changed_bytes).as_bytes());
+        assert!(resident.inputs[0].direct_object_bytes.is_none());
+    }
+
+    #[test]
     fn input_metadata_recheck_rejects_a_changed_file() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -5295,6 +5491,9 @@ mod tests {
 
     #[test]
     fn output_patch_ranges_reject_cross_record_overlap_before_patching() {
+        // Cargo's fixed-width `linker-stress` edit is a real 18-object Rustc transition. Keep
+        // the cache batch large enough for that qualified topology while retaining a hard cap.
+        assert_eq!(super::MAX_CHANGED_DIRECT_OBJECTS, 32);
         assert!(!super::changed_object_count_is_supported(0));
         assert!(super::changed_object_count_is_supported(1));
         assert!(super::changed_object_count_is_supported(

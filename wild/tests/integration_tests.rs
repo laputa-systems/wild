@@ -447,6 +447,8 @@ fn main() -> Result<std::process::ExitCode> {
     collect_macho_dylib_dependency_qualification(&mut tests, &filter)?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_macho_stable_layout_cache_qualification(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    collect_macho_inline_cache_interposer_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
 }
 
@@ -1452,6 +1454,177 @@ fn collect_macho_stable_layout_cache_qualification(
     Ok(())
 }
 
+/// Exercises the opt-in client in the linker parent's `posix_spawn` and `posix_spawnp` calls.
+/// Rustc uses the direct spawn boundary for its linker child, so a hit must publish the verified
+/// executable before the parent waits on its minimal successful child.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn collect_macho_inline_cache_interposer_qualification(
+    tests: &mut Vec<Trial>,
+    filter: &Filter,
+) -> Result {
+    const NAME: &str = "macho/aarch64/stable-layout-cache-inline-parent/default";
+    if filter.excludes(NAME) {
+        return Ok(());
+    }
+    tests.push(Trial::test(NAME, || {
+        run_macho_inline_cache_interposer_qualification()
+            .map_err(|error| libtest_mimic::Failed::from(error.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_macho_inline_cache_interposer_qualification() -> Result {
+    let fixture_dir = base_dir().join("tests").join("macho_stable_layout_cache");
+    let main_source = fixture_dir.join("main.s");
+    let changed_main_source = fixture_dir.join("main-changed.s");
+    let local_source = fixture_dir.join("local.s");
+    let output_dir_guard = tempfile::Builder::new()
+        .prefix("wild-macho-inline-cache-")
+        .tempdir_in("/tmp")
+        .context("failed to create inline-cache qualification directory")?;
+    let output_dir = output_dir_guard.path();
+    let direct_main_object = output_dir.join("direct-main.o");
+    let path_main_object = output_dir.join("path-main.o");
+    let local_object = output_dir.join("local.o");
+    let direct_binary = output_dir.join("stable-layout-cache-inline-direct");
+    let path_binary = output_dir.join("stable-layout-cache-inline-path");
+    let direct_cache_dir = output_dir.join("direct-cache");
+    let path_cache_dir = output_dir.join("path-cache");
+    let inline_library = output_dir.join("wild-macho-cache-inline.dylib");
+    let probe = output_dir.join("macho-cache-inline-probe");
+    let sdk = macos_sdk_path()?;
+
+    // Each spawn API receives its own cold baseline before the shared object change. A cache hit
+    // may advance its state, so this keeps the two assertions independent observations.
+    compile_macho_stable_layout_cache_fixture(&main_source, &direct_main_object)?;
+    compile_macho_stable_layout_cache_fixture(&main_source, &path_main_object)?;
+    compile_macho_stable_layout_cache_fixture(&local_source, &local_object)?;
+    link_macho_stable_layout_cache_fixture(
+        &direct_binary,
+        &direct_cache_dir,
+        &sdk,
+        &direct_main_object,
+        &local_object,
+        false,
+        false,
+    )?;
+    link_macho_stable_layout_cache_fixture(
+        &path_binary,
+        &path_cache_dir,
+        &sdk,
+        &path_main_object,
+        &local_object,
+        false,
+        false,
+    )?;
+    compile_macho_stable_layout_cache_fixture(&changed_main_source, &direct_main_object)?;
+    compile_macho_stable_layout_cache_fixture(&changed_main_source, &path_main_object)?;
+    compile_macho_cache_inline_interposer(&inline_library)?;
+    compile_macho_cache_inline_probe(&probe)?;
+
+    // Non-cache children still use the ordinary PATH resolution after dyld has interposed the
+    // parent. This is the fallback Rustc takes on a cache miss without a slash-qualified linker.
+    let fallback = Command::new(&probe)
+        .arg("true")
+        .env("DYLD_INSERT_LIBRARIES", &inline_library)
+        .env("PATH", "/usr/bin")
+        .output()
+        .context("failed to run inline-cache posix_spawnp fallback probe")?;
+    ensure!(
+        fallback.status.success(),
+        "inline-cache posix_spawnp fallback probe failed with {}:\n{}{}",
+        fallback.status,
+        String::from_utf8_lossy(&fallback.stdout),
+        String::from_utf8_lossy(&fallback.stderr),
+    );
+
+    let run_probe = |direct_spawn: bool| -> Result<String> {
+        let mut command = Command::new(&probe);
+        if direct_spawn {
+            command.arg("--posix-spawn");
+        }
+        let (binary, cache_dir, main_object) = if direct_spawn {
+            (&direct_binary, &direct_cache_dir, &direct_main_object)
+        } else {
+            (&path_binary, &path_cache_dir, &path_main_object)
+        };
+        command.arg(wild_path());
+        configure_macho_stable_layout_cache_link(
+            &mut command,
+            &binary,
+            &cache_dir,
+            &sdk,
+            &main_object,
+            &local_object,
+        );
+        command
+            .env("DYLD_INSERT_LIBRARIES", &inline_library)
+            .env("WILD_MACHO_INCREMENTAL_CACHE_INLINE", "1")
+            .env("WILD_MACHO_INCREMENTAL_CACHE_INLINE_DIAGNOSTICS", "1")
+            .env("WILD_MACHO_INCREMENTAL_CACHE_SERVICE", "1")
+            .env(
+                "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR",
+                output_dir.join("service"),
+            )
+            .env("WILD_MACHO_INCREMENTAL_CACHE_SERVICE_SERVER", wild_path());
+        let output = command
+            .output()
+            .context("failed to run inline-cache parent probe")?;
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        ensure!(
+            output.status.success(),
+            "inline-cache parent probe failed with {}:\n{transcript}",
+            output.status,
+        );
+        Ok(transcript)
+    };
+    for (spawn_name, transcript) in [
+        ("posix_spawn", run_probe(true)?),
+        ("posix_spawnp", run_probe(false)?),
+    ] {
+        ensure!(
+            transcript.contains("wild: Mach-O stable-layout cache hit:"),
+            "inline-cache {spawn_name} probe did not publish a cache hit:\n{transcript}",
+        );
+        ensure!(
+            transcript.contains("wild inline cache: replacing linker child"),
+            "inline-cache {spawn_name} probe did not replace the linker child:\n{transcript}",
+        );
+    }
+    // Advance the direct-spawn cache a second time while its service is still resident. This
+    // guards the state handoff that makes a sequence of Rustc incremental links avoid a linker
+    // process, rather than proving only the first cache transition.
+    compile_macho_stable_layout_cache_fixture(&main_source, &direct_main_object)?;
+    let second_direct_transcript = run_probe(true)?;
+    ensure!(
+        second_direct_transcript.contains("wild: Mach-O stable-layout cache hit:"),
+        "second inline-cache posix_spawn probe did not publish a cache hit:\n{second_direct_transcript}",
+    );
+    ensure!(
+        second_direct_transcript.contains("wild inline cache: replacing linker child"),
+        "second inline-cache posix_spawn probe did not replace the linker child:\n{second_direct_transcript}",
+    );
+    for binary in [&direct_binary, &path_binary] {
+        verify_code_signature(binary)?;
+        let run = Command::new(binary)
+            .output()
+            .with_context(|| format!("failed to run inline-cache executable {}", binary.display()))?;
+        ensure!(
+            run.status.code() == Some(42),
+            "inline-cache executable exited with {}:\n{}{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_macho_stable_layout_cache_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("macho_stable_layout_cache");
@@ -1486,6 +1659,7 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         &main_object,
         &local_object,
         false,
+        false,
     )?;
     ensure!(
         cache_dir.read_dir()?.next().is_some(),
@@ -1509,6 +1683,7 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         &main_object,
         &local_object,
         true,
+        false,
     )?;
     ensure!(
         transcript.contains("wild: Mach-O stable-layout cache hit:"),
@@ -1526,8 +1701,10 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     verify_code_signature(&binary)?;
 
     // A successful signature and runtime are necessary but insufficient evidence that both raw
-    // patch records composed exactly like the writer. Compare against a normal link before any
-    // subsequent cache hit changes the first composed output.
+    // patch records composed exactly like the writer. Compare every non-derived byte against a
+    // normal link before any subsequent cache hit changes the first composed output. The cache
+    // deliberately advances its own UUID chain, so its UUID and the ad-hoc signature derived
+    // from that UUID are validated separately rather than required to match a full link's bytes.
     std::fs::create_dir(&normal_composed_output_dir)?;
     let normal_composed_binary = normal_composed_output_dir.join("stable-layout-cache");
     link_macho_stable_layout_cache_fixture(
@@ -1537,10 +1714,11 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         &main_object,
         &local_object,
         false,
+        false,
     )?;
     ensure!(
-        std::fs::read(&binary)? == std::fs::read(&normal_composed_binary)?,
-        "composed cache output differs from a normal link with the same basename"
+        macho_cache_output_matches_normal_link(&binary, &normal_composed_binary)?,
+        "composed cache output differs from a normal link outside its derived UUID and signature"
     );
 
     // Cargo is allowed to retire the old `-o` before it invokes the linker. With no authenticated
@@ -1555,6 +1733,7 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         &sdk,
         &main_object,
         &local_object,
+        true,
         true,
     )?;
     ensure!(
@@ -1571,6 +1750,30 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     );
     verify_code_signature(&binary)?;
 
+    // A second resident-service hit must retain the first service output and mutable input state.
+    // Returning to the changed entry object keeps the moved local symbol live, so this exercises
+    // state carried across two independent linker processes and verifies a fresh valid signature.
+    std::fs::remove_file(&binary)?;
+    compile_macho_stable_layout_cache_fixture(&changed_main_source, &main_object)?;
+    let third_transcript = link_macho_stable_layout_cache_fixture(
+        &binary,
+        &cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        true,
+        true,
+    )?;
+    ensure!(
+        third_transcript.contains("wild: Mach-O stable-layout cache hit:"),
+        "second resident-service cache hit did not use its retained current image:\n{third_transcript}"
+    );
+    ensure!(
+        macho_cache_output_matches_normal_link(&binary, &normal_composed_binary)?,
+        "resident cache output differs from a normal link outside its derived UUID and signature"
+    );
+    verify_code_signature(&binary)?;
+
     std::fs::create_dir(&normal_output_dir)?;
     let normal_binary = normal_output_dir.join("stable-layout-cache");
     link_macho_stable_layout_cache_fixture(
@@ -1580,10 +1783,11 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         &main_object,
         &local_object,
         false,
+        false,
     )?;
     ensure!(
-        std::fs::read(&binary)? == std::fs::read(&normal_binary)?,
-        "cached stable-layout output differs from a normal link with the same basename"
+        macho_cache_output_matches_normal_link(&binary, &normal_binary)?,
+        "cached stable-layout output differs from a normal link outside its derived UUID and signature"
     );
     let run = Command::new(&binary)
         .output()
@@ -1618,6 +1822,46 @@ fn compile_macho_stable_layout_cache_fixture(source: &Path, output: &Path) -> Re
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn compile_macho_cache_inline_interposer(output: &Path) -> Result {
+    let source = base_dir().join("src").join("bin").join("macho-cache-inline.c");
+    let result = Command::new("cc")
+        .args(["-dynamiclib", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .with_context(|| format!("failed to compile inline cache interposer {}", source.display()))?;
+    ensure!(
+        result.status.success(),
+        "failed to compile inline cache interposer {}:\n{}{}",
+        source.display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn compile_macho_cache_inline_probe(output: &Path) -> Result {
+    let source = base_dir().join("tests").join("macho_cache_inline_probe.c");
+    let result = Command::new("cc")
+        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .with_context(|| format!("failed to compile inline cache probe {}", source.display()))?;
+    ensure!(
+        result.status.success(),
+        "failed to compile inline cache probe {}:\n{}{}",
+        source.display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn macos_sdk_path() -> Result<PathBuf> {
     let output = Command::new("xcrun")
         .arg("--show-sdk-path")
@@ -1643,8 +1887,55 @@ fn link_macho_stable_layout_cache_fixture(
     main_object: &Path,
     local_object: &Path,
     expect_cache_hit: bool,
+    use_resident_service: bool,
 ) -> Result<String> {
     let mut command = Command::new(wild_path());
+    configure_macho_stable_layout_cache_link(
+        &mut command,
+        binary,
+        cache_dir,
+        sdk,
+        main_object,
+        local_object,
+    );
+    if expect_cache_hit {
+        command.env("WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS", "1");
+    }
+    if use_resident_service {
+        command
+            .env("WILD_MACHO_INCREMENTAL_CACHE_SERVICE", "1")
+            .env(
+                "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR",
+                cache_dir.parent().unwrap_or(cache_dir).join("service"),
+            );
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to link stable-layout-cache fixture {}", binary.display()))?;
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    ensure!(
+        output.status.success(),
+        "stable-layout-cache link failed for {}:\n{transcript}",
+        binary.display()
+    );
+    Ok(transcript)
+}
+
+/// Configures the exact tiny Mach-O link used by both direct cache qualification and the parent
+/// probe. Keeping it shared ensures the interposer test changes only the Rustc-like spawn boundary.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn configure_macho_stable_layout_cache_link(
+    command: &mut Command,
+    binary: &Path,
+    cache_dir: &Path,
+    sdk: &Path,
+    main_object: &Path,
+    local_object: &Path,
+) {
     command
         .args([
             "-arch",
@@ -1664,23 +1955,104 @@ fn link_macho_stable_layout_cache_fixture(
         .arg(main_object)
         .arg(local_object)
         .arg("-lSystem");
-    if expect_cache_hit {
-        command.env("WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS", "1");
+}
+
+/// The incremental cache derives a UUID from its bounded change chain rather than rehashing the
+/// complete image. A valid ad-hoc signature necessarily changes with that UUID. Every other byte
+/// must still match an ordinary link with the same output basename; `codesign` separately proves
+/// the rebuilt signature covers those identical code and data bytes.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn macho_cache_output_matches_normal_link(cache_output: &Path, normal_output: &Path) -> Result<bool> {
+    let mut cache = std::fs::read(cache_output)
+        .with_context(|| format!("failed to read cached output {}", cache_output.display()))?;
+    let mut normal = std::fs::read(normal_output)
+        .with_context(|| format!("failed to read normal output {}", normal_output.display()))?;
+    if cache.len() != normal.len()
+        || !mask_macho_cache_derived_identity(&mut cache)
+        || !mask_macho_cache_derived_identity(&mut normal)
+    {
+        return Ok(false);
     }
-    let output = command
-        .output()
-        .with_context(|| format!("failed to link stable-layout-cache fixture {}", binary.display()))?;
-    let transcript = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    ensure!(
-        output.status.success(),
-        "stable-layout-cache link failed for {}:\n{transcript}",
-        binary.display()
-    );
-    Ok(transcript)
+    Ok(cache == normal)
+}
+
+/// Zeros the only Mach-O regions that are intentionally different between a stable-cache replay
+/// and a full link: `LC_UUID` and the embedded ad-hoc signature that authenticates that UUID.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mask_macho_cache_derived_identity(bytes: &mut [u8]) -> bool {
+    const MACH_HEADER_64_SIZE: usize = 32;
+    const NCMDS_OFFSET: usize = 16;
+    const LOAD_COMMAND_SIZE: usize = 8;
+    const UUID_COMMAND_SIZE: usize = 24;
+    const LINKEDIT_DATA_COMMAND_SIZE: usize = 16;
+    const LC_UUID: u32 = 0x1b;
+    const LC_CODE_SIGNATURE: u32 = 0x1d;
+
+    let Some(ncmds) = macho_u32(bytes, NCMDS_OFFSET) else {
+        return false;
+    };
+    let mut command_offset = MACH_HEADER_64_SIZE;
+    let mut found_uuid = false;
+    let mut found_signature = false;
+    for _ in 0..ncmds {
+        let Some(command_kind) = macho_u32(bytes, command_offset) else {
+            return false;
+        };
+        let command_size = macho_u32(bytes, command_offset + size_of::<u32>())
+            .and_then(|size| usize::try_from(size).ok());
+        let Some(command_size) = command_size else {
+            return false;
+        };
+        let Some(command_end) = command_offset.checked_add(command_size) else {
+            return false;
+        };
+        if command_size < LOAD_COMMAND_SIZE || command_end > bytes.len() {
+            return false;
+        }
+        if command_kind == LC_UUID {
+            if command_size != UUID_COMMAND_SIZE {
+                return false;
+            }
+            let Some(uuid) = bytes.get_mut(command_offset + LOAD_COMMAND_SIZE..command_end) else {
+                return false;
+            };
+            uuid.fill(0);
+            found_uuid = true;
+        }
+        if command_kind == LC_CODE_SIGNATURE {
+            if command_size != LINKEDIT_DATA_COMMAND_SIZE {
+                return false;
+            }
+            let Some(data_offset) = macho_u32(bytes, command_offset + LOAD_COMMAND_SIZE) else {
+                return false;
+            };
+            let Some(data_size) = macho_u32(bytes, command_offset + LOAD_COMMAND_SIZE + size_of::<u32>()) else {
+                return false;
+            };
+            let Ok(data_offset) = usize::try_from(data_offset) else {
+                return false;
+            };
+            let Ok(data_size) = usize::try_from(data_size) else {
+                return false;
+            };
+            let Some(data_end) = data_offset.checked_add(data_size) else {
+                return false;
+            };
+            let Some(signature) = bytes.get_mut(data_offset..data_end) else {
+                return false;
+            };
+            signature.fill(0);
+            found_signature = true;
+        }
+        command_offset = command_end;
+    }
+    found_uuid && found_signature
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn macho_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; size_of::<u32>()] = bytes.get(offset..offset.checked_add(size_of::<u32>())?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
